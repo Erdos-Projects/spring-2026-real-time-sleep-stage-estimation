@@ -1,0 +1,50 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+venv/
+ENV/
+env/
+.env
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Data and large files 
+# Often better to track these with DVC instead of Git
+data/raw/
+data/processed/
+data/interim/
+data/external/
+*.csv
+*.parquet
+*.jsonl
+*.zip
+*.gz
+
+# Model checkpoints and weights
+models/*.pkl
+models/*.h5
+models/*.joblib
+models/*.onnx
+models/*.pth
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+# Optional: Ignore notebook outputs if not using nbstripout
+# *.nbconvert.ipynb
+
+# IDEs and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs and Reports
+logs/
+*.log
+reports/figures/
