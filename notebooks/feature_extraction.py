@@ -218,13 +218,15 @@ def process_one_subject(csv_path, out_dir, epoch_sec=EPOCH_SEC, fs=100):
     if out_path.exists():
         return sid, "skipped"
 
-    df = pd.read_csv(csv_path)
+    df_original = pd.read_csv(csv_path)
 
     # normalize column names
-    df.columns = df.columns.str.lower().str.replace(' ','')
+    df_original.columns = df_original.columns.str.lower().str.replace(' ','')
+    df = pd.DataFrame()
     for old_var, new_var in vars_to_consider.items():
-        if old_var in df.columns:
-            df[new_var] = df[old_var]
+        if old_var in df_original.columns:
+            df[new_var] = df_original[old_var]
+    
     # replace NA with 0, missingness indicator
     null_columns = []
     for column, count in df.isnull().sum().items():
