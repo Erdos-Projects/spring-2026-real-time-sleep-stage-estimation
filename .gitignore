@@ -12,6 +12,7 @@ env/
 .venv
 pip-log.txt
 pip-delete-this-directory.txt
+environment.yml
 
 # Data and large files 
 # Often better to track these with DVC instead of Git
