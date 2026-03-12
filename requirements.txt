@@ -1,0 +1,37 @@
+# local package
+-e .
+
+# external requirements
+click
+pre_commit
+flake8
+black
+isort
+mypy
+nbstripout
+pyyaml
+pandas
+numpy
+scipy
+scikit-learn
+numba
+statsmodels
+matplotlib
+seaborn
+bokeh
+python-dotenv>=0.5.1
+SciencePlots
+omegaconf
+dill
+jax[cuda12]
+tqdm
+python-pptx
+# backwards compatibility
+pathlib2
+wheel
+cython
+pyarrow
+fastparquet
+xgboost
+shap
+optuna
