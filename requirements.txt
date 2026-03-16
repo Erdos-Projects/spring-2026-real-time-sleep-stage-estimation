@@ -33,5 +33,6 @@ cython
 pyarrow
 fastparquet
 xgboost
+lightgbm
 shap
 optuna
