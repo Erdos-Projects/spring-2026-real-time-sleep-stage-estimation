@@ -31,7 +31,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
 from sklearn.preprocessing import MultiLabelBinarizer, OneHotEncoder
-from scipy.signal import welch
+from scipy.signal import welch, find_peaks
 from scipy.stats import entropy
 
 from config import dir_config
@@ -128,6 +128,115 @@ def extract_eda_phasic(eda_signal, threshold=0.01):
     mean_amp = np.mean(diff[peaks]) if count>0 else 0
     return {'eda_scr_count': int(count), 'eda_scr_mean_amp': mean_amp}
 
+def compute_respiratory_rate(resp_flow, fs, min_hz=0.1, max_hz=0.6):
+    """Estimate respiratory rate from flow signal via peak detection.
+
+    Returns breaths-per-minute and inter-breath interval CV (irregularity).
+    """
+    if len(resp_flow) < 2:
+        return {'resp_rate_bpm': np.nan, 'resp_ibi_cv': np.nan}
+
+    min_dist = int(fs / max_hz)  # minimum samples between peaks
+    peaks, _ = find_peaks(resp_flow, distance=min_dist, height=np.percentile(resp_flow, 25))
+
+    n_peaks = len(peaks)
+    duration_sec = len(resp_flow) / fs
+    bpm = (n_peaks / duration_sec) * 60 if duration_sec > 0 else np.nan
+
+    if n_peaks >= 2:
+        ibi = np.diff(peaks) / fs  # inter-breath intervals in seconds
+        cv = np.std(ibi) / np.mean(ibi) if np.mean(ibi) > 0 else np.nan
+    else:
+        cv = np.nan
+
+    return {'resp_rate_bpm': bpm, 'resp_ibi_cv': cv}
+
+
+def compute_thorax_abdomen_coherence(thorax, abdomen):
+    """Pearson correlation between thorax and abdomen effort signals.
+
+    Positive = in-phase (normal breathing).
+    Negative = paradoxical (hallmark of obstructive apnea).
+    """
+    if len(thorax) < 2 or np.std(thorax) == 0 or np.std(abdomen) == 0:
+        return np.nan
+    return float(np.corrcoef(thorax, abdomen)[0, 1])
+
+
+def compute_sao2_desaturation_rate(sao2):
+    """Most negative per-sample change in SpO2 — flags rapid desaturation."""
+    if len(sao2) < 2:
+        return {'sao2_desat_rate': np.nan}
+    return {'sao2_desat_rate': float(np.diff(sao2.astype(float)).min())}
+
+
+def compute_effort_flow_paradox(thorax, abdomen, resp_flow, effort_threshold=0.02, flow_threshold=0.02):
+    """Flag: respiratory effort present (thorax/abdomen moving) but no airflow.
+
+    Returns 1 if paradoxical breathing is detected, else 0.
+    Classic sign of obstructive apnea.
+    """
+    effort_std = (np.std(thorax) + np.std(abdomen)) / 2
+    flow_std = np.std(resp_flow)
+    return int(effort_std > effort_threshold and flow_std < flow_threshold)
+
+
+def compute_hrv_extended(ibi_ms, fs_ibi=100):
+    """HRV metrics on a longer IBI window plus LF/HF frequency ratio.
+
+    ibi_ms: IBI signal values (milliseconds at original sampling rate).
+    """
+    if len(ibi_ms) < 4:
+        return {'ibi_sdnn_ext': np.nan, 'ibi_rmssd_ext': np.nan,
+                'ibi_pnn50_ext': np.nan, 'ibi_lf_hf': np.nan}
+
+    diff = np.diff(ibi_ms)
+    sdnn  = float(np.std(ibi_ms))
+    rmssd = float(np.sqrt(np.mean(diff ** 2)))
+    pnn50 = float(np.sum(np.abs(diff) > 50) / len(diff))
+
+    # LF/HF ratio via Welch PSD on the IBI series
+    try:
+        freqs, psd = welch(ibi_ms, fs=fs_ibi, nperseg=min(4 * fs_ibi, len(ibi_ms)))
+        lf = float(np.trapz(psd[(freqs >= 0.04) & (freqs < 0.15)],
+                             freqs[(freqs >= 0.04) & (freqs < 0.15)]))
+        hf = float(np.trapz(psd[(freqs >= 0.15) & (freqs < 0.40)],
+                             freqs[(freqs >= 0.15) & (freqs < 0.40)]))
+        lf_hf = lf / hf if hf > 0 else np.nan
+    except Exception:
+        lf_hf = np.nan
+
+    return {'ibi_sdnn_ext': sdnn, 'ibi_rmssd_ext': rmssd,
+            'ibi_pnn50_ext': pnn50, 'ibi_lf_hf': lf_hf}
+
+
+def compute_snore_bursts(snore_signal, threshold_pct=75):
+    """Count snore events and measure longest burst duration above threshold.
+
+    Returns snore event count and max burst length (in samples).
+    """
+    if len(snore_signal) < 2:
+        return {'snore_event_count': 0, 'snore_max_burst': 0}
+
+    threshold = np.percentile(np.abs(snore_signal), threshold_pct)
+    above = (np.abs(snore_signal) > threshold).astype(int)
+
+    # Count leading-edge transitions (0→1) as events
+    events = int(np.sum(np.diff(np.concatenate([[0], above])) == 1))
+
+    # Longest consecutive run above threshold
+    max_burst = 0
+    current = 0
+    for v in above:
+        if v:
+            current += 1
+            max_burst = max(max_burst, current)
+        else:
+            current = 0
+
+    return {'snore_event_count': events, 'snore_max_burst': max_burst}
+
+
 # -----------------------------
 # Main extraction function
 # -----------------------------
@@ -191,12 +300,17 @@ def extract_full_multimodal(df, signals, epoch_sec=EPOCH_SEC, fs=100):
                     epoch_feats[f'{sig}_bp_{band_name}'] = bandpower(emg_signal, fs, band_range)
 
         # -----------------------------
-        # IBI / HRV metrics
+        # IBI / HRV metrics (short window — kept for backward compatibility)
         # -----------------------------
         if 'ibi' in epoch_df.columns and len(epoch_df['ibi'])>1:
             ibi_ms = epoch_df['ibi'].values
             hrv = compute_hrv_metrics(ibi_ms)
             epoch_feats.update({f'ibi_{k}':v for k,v in hrv.items()})
+
+        # HRV on extended 25s window + LF/HF ratio
+        if 'ibi' in extended_epoch_df.columns and len(extended_epoch_df['ibi']) > 3:
+            hrv_ext = compute_hrv_extended(extended_epoch_df['ibi'].values, fs_ibi=fs)
+            epoch_feats.update(hrv_ext)
 
         # -----------------------------
         # EDA phasic peaks
@@ -225,6 +339,54 @@ def extract_full_multimodal(df, signals, epoch_sec=EPOCH_SEC, fs=100):
                 epoch_feats['acc_eda_corr'] = np.corrcoef(acc_mag, epoch_df['eda'].values)[0,1]
             else:
                 epoch_feats['acc_eda_corr'] = np.nan
+
+        # -----------------------------
+        # Respiratory clinical features
+        # -----------------------------
+        # Respiratory rate (breaths per minute) and irregularity — use extended window for stability
+        if 'resp_flow' in extended_epoch_df.columns and len(extended_epoch_df['resp_flow']) > fs:
+            rr = compute_respiratory_rate(extended_epoch_df['resp_flow'].values, fs=fs)
+            epoch_feats.update(rr)
+
+        # Thorax-abdomen phase coherence (negative = paradoxical breathing = obstructive sign)
+        if ('resp_thorax' in extended_epoch_df.columns and
+                'resp_abdomen' in extended_epoch_df.columns and
+                len(extended_epoch_df) > 1):
+            epoch_feats['resp_thorax_abdomen_coherence'] = compute_thorax_abdomen_coherence(
+                extended_epoch_df['resp_thorax'].values,
+                extended_epoch_df['resp_abdomen'].values,
+            )
+
+        # Effort-flow paradox flag (effort present but no airflow)
+        if all(c in epoch_df.columns for c in ['resp_thorax', 'resp_abdomen', 'resp_flow']):
+            epoch_feats['resp_effort_flow_paradox'] = compute_effort_flow_paradox(
+                epoch_df['resp_thorax'].values,
+                epoch_df['resp_abdomen'].values,
+                epoch_df['resp_flow'].values,
+            )
+
+        # SpO2 desaturation rate (most negative per-sample drop)
+        if 'sao2' in epoch_df.columns and len(epoch_df['sao2']) > 1:
+            epoch_feats.update(compute_sao2_desaturation_rate(epoch_df['sao2'].values))
+
+        # -----------------------------
+        # Snore burst features
+        # -----------------------------
+        if 'snore' in epoch_df.columns and len(epoch_df['snore']) > 1:
+            epoch_feats.update(compute_snore_bursts(epoch_df['snore'].values))
+
+        # -----------------------------
+        # EEG arousal ratio: (beta+gamma) / (delta+theta) — arousals from apnea increase this
+        # -----------------------------
+        for sig in signals:
+            if sig.lower().startswith('eeg') and sig in epoch_df.columns:
+                eeg_ext = extended_epoch_df[sig].values
+                bp_delta = bandpower(eeg_ext, fs, EEG_BANDS['delta'])
+                bp_theta = bandpower(eeg_ext, fs, EEG_BANDS['theta'])
+                bp_beta  = bandpower(eeg_ext, fs, EEG_BANDS['beta'])
+                bp_gamma = bandpower(eeg_ext, fs, EEG_BANDS['gamma'])
+                denom = bp_delta + bp_theta
+                epoch_feats[f'{sig}_arousal_ratio'] = (bp_beta + bp_gamma) / denom if denom > 0 else np.nan
 
         # ------------------------------
         # Target variables

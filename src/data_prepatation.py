@@ -54,7 +54,17 @@ def create_batched_splits(
         target_future_steps=target_future_steps,
     )
 
+    # Drop subjects that produced zero valid batches (recording too short for batch_size)
+    batches = {sid: b for sid, b in batches.items() if len(b) > 0}
+
     subject_ids = np.array(list(batches.keys()))
+    if len(subject_ids) == 0:
+        raise ValueError(
+            "No valid batches were produced. Check that parquet_files is non-empty "
+            f"and that recordings are longer than batch_size={batch_size} rows."
+        )
+
+    n_leave_out = min(n_leave_out, max(0, len(subject_ids) - 1))  # need at least 1 subject for training
     left_out_subjects = rng.choice(subject_ids, size=n_leave_out, replace=False).tolist()
     print(f"Subjects left out: {left_out_subjects}")
 
@@ -63,17 +73,31 @@ def create_batched_splits(
     for subject_id, subject_batches in batches.items():
         if subject_id in left_out_subjects:
             continue
-
-        subject_batches = subject_batches.copy()
-        rng.shuffle(subject_batches)
-
+        # Keep batches in chronological order: train = early night, test = late night.
+        # Shuffling would allow future data to leak into training via lag features.
         n = len(subject_batches)
         n_test = round(n * test_ratio)
         n_val = round(n * val_ratio)
+        n_train = n - n_val - n_test
 
-        train_batches.extend(subject_batches[: n - n_val - n_test])
-        val_batches.extend(subject_batches[n - n_val - n_test : n - n_test])
-        test_batches.extend(subject_batches[n - n_test :])
+        # Interleaved 3:1:1 split: vectorised mod on full groups, then sequential remainder
+        n_full  = (n // 5) * 5
+        idx     = np.arange(n_full)
+        mod     = idx % 5
+        train_idx = idx[mod <= 2].tolist()
+        val_idx   = idx[mod == 3].tolist()
+        test_idx  = idx[mod == 4].tolist()
+
+        n_tr_rem = n_train - len(train_idx)
+        n_vl_rem = n_val   - len(val_idx)
+        rem = list(range(n_full, n))
+        train_idx.extend(rem[:n_tr_rem])
+        val_idx.extend(rem[n_tr_rem : n_tr_rem + n_vl_rem])
+        test_idx.extend(rem[n_tr_rem + n_vl_rem :])
+
+        train_batches.extend(subject_batches[i] for i in train_idx)
+        val_batches.extend(subject_batches[i]   for i in val_idx)
+        test_batches.extend(subject_batches[i]  for i in test_idx)
 
     train_df = pd.concat(train_batches, ignore_index=True)
     val_df = pd.concat(val_batches, ignore_index=True)
@@ -190,6 +214,33 @@ def remove_feature_columns(df: pd.DataFrame, target_type: str) -> pd.DataFrame:
     return df.drop(columns=columns_to_drop)
 
 
+# def add_lag_features(
+#     df: pd.DataFrame,
+#     features: list[str] | None = None,
+#     max_lag: int = 0,
+# ) -> pd.DataFrame:
+#     """
+#     Add lag features for specified columns.
+
+#     Args:
+#         df:       Input DataFrame.
+#         features: List of feature names to create lag features for.
+#         max_lag:  Maximum number of lag periods to create.
+
+#     Returns:
+#         DataFrame with lag features added.
+#     """
+#     if not features or max_lag < 1:
+#         return df
+
+#     df = df.copy()
+#     for feature in features:
+#         for lag in range(1, max_lag + 1):
+#             df[f"{feature}_lag{lag}"] = df[feature].shift(lag)
+
+#     # Drop first max_lag rows which have NaN values from the lag shift
+#     return df.iloc[max_lag:].reset_index(drop=True)
+
 def add_lag_features(
     df: pd.DataFrame,
     features: list[str] | None = None,
@@ -197,22 +248,21 @@ def add_lag_features(
 ) -> pd.DataFrame:
     """
     Add lag features for specified columns.
-
-    Args:
-        df:       Input DataFrame.
-        features: List of feature names to create lag features for.
-        max_lag:  Maximum number of lag periods to create.
-
-    Returns:
-        DataFrame with lag features added.
     """
     if not features or max_lag < 1:
         return df
 
-    df = df.copy()
-    for feature in features:
-        for lag in range(1, max_lag + 1):
-            df[f"{feature}_lag{lag}"] = df[feature].shift(lag)
+    base = df.copy()
 
-    # Drop first max_lag rows which have NaN values from the lag shift
-    return df.iloc[max_lag:].reset_index(drop=True)
+    # Build all lagged columns first, then concat once to avoid fragmentation.
+    lagged_cols = {
+        f"{feature}_lag{lag}": base[feature].shift(lag)
+        for feature in features
+        for lag in range(1, max_lag + 1)
+    }
+    lagged_df = pd.DataFrame(lagged_cols, index=base.index)
+
+    out = pd.concat([base, lagged_df], axis=1)
+
+    # Drop first max_lag rows which have NaN values from lag shift
+    return out.iloc[max_lag:].reset_index(drop=True)
