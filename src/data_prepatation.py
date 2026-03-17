@@ -129,6 +129,9 @@ def _chunk_subjects(
             batch = add_lag_features(batch, features=top_features, max_lag=top_features_lag)
             batch = remove_feature_columns(batch, target_type)
 
+            batch['subject_id'] = subject_id  # keep track of subject in each batch
+            batch['chunk_id'] = f"{subject_id}_chunk{start // (batch_size + gap_size)}"  # unique chunk identifier
+
             subject_batches.append(batch)
 
         batches[subject_id] = subject_batches
@@ -150,6 +153,18 @@ def add_future_target(df: pd.DataFrame, target_type: str = 'apnea', future_steps
     """
     if target_type == 'apnea':
         df['target'] = df[apnea_cols].shift(-future_steps).max(axis=1)
+    elif target_type == 'apnea_type':
+        shifted = df[apnea_cols].shift(-future_steps)
+        df['target'] = shifted.apply(
+            lambda row: 'none'         if row.sum() == 0 else
+                        'mixed'        if row.sum() > 1  else
+                        'obstructive'  if row['apnea_obstructive'] == 1 else
+                        'central'      if row['apnea_central'] == 1 else
+                        'hypopnea'     if row['apnea_hypopnea'] == 1 else
+                        'mixed',
+            axis=1
+        )
+
     elif target_type == 'sleep_stage':
         raise NotImplementedError("Future target for sleep stage prediction is not implemented yet.")
 
@@ -167,7 +182,7 @@ def remove_feature_columns(df: pd.DataFrame, target_type: str) -> pd.DataFrame:
     Returns:
         DataFrame with non-feature columns removed.
     """
-    if target_type == 'apnea':
+    if target_type == 'apnea' or target_type == 'apnea_type':
         columns_to_drop = sleep_stage_cols + apnea_cols + epoch_cols + subject_col + additional_cols
     elif target_type == 'sleep_stage':
         raise NotImplementedError("Feature column removal for sleep stage prediction is not implemented yet.")
