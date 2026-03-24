@@ -322,23 +322,26 @@ def extract_full_multimodal(df, signals, epoch_sec=EPOCH_SEC, fs=100):
         # -----------------------------
         # Cross-signal features
         # -----------------------------
+        corr_threshold = 1e-3
         # HR/BVP correlation
         if 'hr' in epoch_df.columns and 'bvp' in epoch_df.columns and len(epoch_df)>1:
             hr = epoch_df['hr'].values
             bvp = epoch_df['bvp'].values
-            if np.std(hr) > 0 and np.std(bvp) > 0:
+            # check for constant signals to avoid NaN correlation
+
+            if np.std(hr) > corr_threshold and np.std(bvp) > corr_threshold:
                 epoch_feats['hr_bvp_corr'] = np.corrcoef(hr,bvp)[0,1]
             else:
-                epoch_feats['hr_bvp_corr'] = np.nan
+                epoch_feats['hr_bvp_corr'] = 0
 
         # ACC + EDA arousal proxy
         if 'eda' in epoch_df.columns and 'acc_magnitude' in epoch_df.columns and len(epoch_df)>1:
             acc_mag = epoch_df['acc_magnitude'].values
             # correlation as simple arousal proxy
-            if np.std(acc_mag)>0 and np.std(epoch_df['eda'].values)>0:
+            if np.std(acc_mag)>corr_threshold and np.std(epoch_df['eda'].values)>corr_threshold:
                 epoch_feats['acc_eda_corr'] = np.corrcoef(acc_mag, epoch_df['eda'].values)[0,1]
             else:
-                epoch_feats['acc_eda_corr'] = np.nan
+                epoch_feats['acc_eda_corr'] = 0
 
         # -----------------------------
         # Respiratory clinical features

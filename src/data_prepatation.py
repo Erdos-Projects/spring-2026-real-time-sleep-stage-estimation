@@ -2,52 +2,45 @@
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from sklearn.model_selection import KFold, train_test_split
 
 sleep_stage_cols = ['sleep_stage', 'sleep_stage_transition', 'sleep_stage_trans_prop']
 apnea_cols = ['apnea_obstructive', 'apnea_central', 'apnea_hypopnea', 'apnea_mixed']
-epoch_cols = ['epoch_id', 'epoch_start', 'epoch_end']
 subject_col = []
 additional_cols = ['ahi', 'oahi', 'arousal_index']
 
 
-def create_batched_splits(
+def create_train_val_test_splits(
     parquet_files: list,
-    batch_size: int = 360,
-    gap_size: int = 6,
     top_features: list[str] | None = None,
     top_features_lag: int = 5,
     target_type: str = 'apnea',
     target_future_steps: int = 5,
-    val_ratio: float = 0.2,
+    val_ratio: float = 0.15,
     test_ratio: float = 0.2,
-    n_leave_out: int = 5,
+    n_splits: int = 10,
     random_seed: int = 2542,
-) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, list]:
+):
     """
     Batch parquet files into non-overlapping windows and split into train/val/test sets.
 
     Args:
         parquet_files:        List of parquet file paths.
-        batch_size:           Number of rows per batch.
-        gap_size:             Number of rows to skip between batches (to avoid leakage).
         top_features:         Features to create lag features for. None means no lag features.
         top_features_lag:     Number of lag steps to generate for top_features.
         target_type:          Type of target to generate ('apnea' supported).
         target_future_steps:  How many steps ahead the target looks.
         val_ratio:            Fraction of each subject's batches for validation.
         test_ratio:           Fraction of each subject's batches for testing.
-        n_leave_out:          Number of subjects to exclude entirely.
+        n_splits:             Number of K-fold splits over train subjects.
         random_seed:          Random seed for reproducibility.
 
     Returns:
-        train_X, train_y, val_X, val_y, test_X, test_y, left_out_subjects
+        train_X, train_y, fold_indices, val_X, val_y, test_X, test_y
+        where fold_indices contains (train_idx, val_idx) for each fold.
     """
-    rng = np.random.default_rng(random_seed)
-
-    batches = _chunk_subjects(
+    subject_df = _process_subjects(
         parquet_files=parquet_files,
-        batch_size=batch_size,
-        gap_size=gap_size,
         top_features=top_features or [],
         top_features_lag=top_features_lag,
         target_type=target_type,
@@ -55,112 +48,118 @@ def create_batched_splits(
     )
 
     # Drop subjects that produced zero valid batches (recording too short for batch_size)
-    batches = {sid: b for sid, b in batches.items() if len(b) > 0}
+    # batches = {sid: b for sid, b in batches.items() if len(b) > 0}
 
-    subject_ids = np.array(list(batches.keys()))
+    subject_ids = np.array(list(subject_df.keys()))
     if len(subject_ids) == 0:
         raise ValueError(
             "No valid batches were produced. Check that parquet_files is non-empty "
-            f"and that recordings are longer than batch_size={batch_size} rows."
         )
 
-    n_leave_out = min(n_leave_out, max(0, len(subject_ids) - 1))  # need at least 1 subject for training
-    left_out_subjects = rng.choice(subject_ids, size=n_leave_out, replace=False).tolist()
-    print(f"Subjects left out: {left_out_subjects}")
+    # train/test 80/20 split subjects
+    train_subjects, test_subjects = train_test_split(subject_ids, test_size=test_ratio, random_state=random_seed)
+    train_subjects, val_subjects = train_test_split(train_subjects, test_size=val_ratio, random_state=random_seed)
 
-    train_batches, val_batches, test_batches = [], [], []
-
-    for subject_id, subject_batches in batches.items():
-        if subject_id in left_out_subjects:
-            continue
-        # Keep batches in chronological order: train = early night, test = late night.
-        # Shuffling would allow future data to leak into training via lag features.
-        n = len(subject_batches)
-        n_test = round(n * test_ratio)
-        n_val = round(n * val_ratio)
-        n_train = n - n_val - n_test
-
-        # Interleaved 3:1:1 split: vectorised mod on full groups, then sequential remainder
-        n_full  = (n // 5) * 5
-        idx     = np.arange(n_full)
-        mod     = idx % 5
-        train_idx = idx[mod <= 2].tolist()
-        val_idx   = idx[mod == 3].tolist()
-        test_idx  = idx[mod == 4].tolist()
-
-        n_tr_rem = n_train - len(train_idx)
-        n_vl_rem = n_val   - len(val_idx)
-        rem = list(range(n_full, n))
-        train_idx.extend(rem[:n_tr_rem])
-        val_idx.extend(rem[n_tr_rem : n_tr_rem + n_vl_rem])
-        test_idx.extend(rem[n_tr_rem + n_vl_rem :])
-
-        train_batches.extend(subject_batches[i] for i in train_idx)
-        val_batches.extend(subject_batches[i]   for i in val_idx)
-        test_batches.extend(subject_batches[i]  for i in test_idx)
-
-    train_df = pd.concat(train_batches, ignore_index=True)
-    val_df = pd.concat(val_batches, ignore_index=True)
-    test_df = pd.concat(test_batches, ignore_index=True)
-
-    train_y, train_X = train_df['target'], train_df.drop(columns='target')
-    val_y,   val_X   = val_df['target'],   val_df.drop(columns='target')
-    test_y,  test_X  = test_df['target'],  test_df.drop(columns='target')
-
-    return train_X, train_y, val_X, val_y, test_X, test_y, left_out_subjects
+    train_df = pd.concat([subject_df[sid] for sid in train_subjects], ignore_index=True)
+    val_df = pd.concat([subject_df[sid] for sid in val_subjects], ignore_index=True)
+    test_df = pd.concat([subject_df[sid] for sid in test_subjects], ignore_index=True)
 
 
-def _chunk_subjects(
+    if n_splits < 2:
+        raise ValueError("n_splits must be at least 2.")
+    if n_splits > len(train_subjects):
+        raise ValueError(
+            f"n_splits={n_splits} cannot be greater than number of train subjects="
+            f"{len(train_subjects)}. Reduce n_splits or test_ratio."
+        )
+
+    train_df, val_df, test_df = _remove_missing_values(train_df, val_df, test_df, missing_threshold=0.2)
+    train_df = train_df.reset_index(drop=True)
+    val_df = val_df.reset_index(drop=True)
+    test_df = test_df.reset_index(drop=True)
+
+    # Build subject-level CV splits and map each split to row indices in train_df.
+    kfold = KFold(n_splits=n_splits, shuffle=True, random_state=random_seed)
+    row_indices_by_subject = {
+        sid: train_df.index[train_df['subject_id'] == sid].to_numpy()
+        for sid in train_subjects
+    }
+    fold_indices = []
+    for train_sid_idx, val_sid_idx in kfold.split(train_subjects):
+        train_sid_fold = train_subjects[train_sid_idx]
+        val_sid_fold = train_subjects[val_sid_idx]
+        train_idx = np.concatenate([row_indices_by_subject[sid] for sid in train_sid_fold])
+        val_idx = np.concatenate([row_indices_by_subject[sid] for sid in val_sid_fold])
+        fold_indices.append((train_idx, val_idx))
+
+    train_y = train_df['target']
+    train_X = train_df.drop(columns='target')
+    val_y = val_df['target']
+    val_X = val_df.drop(columns='target')
+    test_y = test_df['target']
+    test_X = test_df.drop(columns='target')
+
+    return train_X, train_y, fold_indices, val_X, val_y, test_X, test_y
+
+def _remove_missing_values(train_df, val_df, test_df, missing_threshold=0.2):
+    missing_train = train_df.isnull().mean()
+    missing_val = val_df.isnull().mean()
+    missing_test = test_df.isnull().mean()
+
+    # make a list of columns which have more than 20% missing values in any of the three sets
+    columns_to_drop = missing_train[missing_train > missing_threshold].index.tolist() + \
+        missing_val[missing_val > missing_threshold].index.tolist() + \
+        missing_test[missing_test > missing_threshold].index.tolist()
+    columns_to_drop = list(set(columns_to_drop))
+    train_df = train_df.drop(columns=columns_to_drop)
+    val_df = val_df.drop(columns=columns_to_drop)
+    test_df = test_df.drop(columns=columns_to_drop)
+
+    # find rows with NaN values in train_X, train_y, val_X, val_y, test_X, test_y
+    train_nan_rows = train_df.isna().any(axis=1)
+    val_nan_rows = val_df.isna().any(axis=1)
+    test_nan_rows = test_df.isna().any(axis=1)
+    # remove rows with NaN values
+    train_df = train_df[~train_nan_rows].reset_index(drop=True)
+    val_df = val_df[~val_nan_rows].reset_index(drop=True)
+    test_df = test_df[~test_nan_rows].reset_index(drop=True)
+    return train_df, val_df, test_df
+
+def _process_subjects(
     parquet_files: list,
-    batch_size: int,
-    gap_size: int,
     top_features: list[str],
     top_features_lag: int,
     target_type: str = 'apnea',
     target_future_steps: int = 5,
-) -> dict[str, list[pd.DataFrame]]:
+) -> dict[str, pd.DataFrame]:
     """
     Read parquet files and chunk each subject's data into non-overlapping batches
     separated by a gap to prevent leakage between splits.
 
     Args:
         parquet_files:        List of parquet file paths.
-        batch_size:           Number of rows per batch.
-        gap_size:             Number of rows to skip between consecutive batches.
         top_features:         Features to create lag features for.
         top_features_lag:     Number of lag steps to generate for top_features.
         target_type:          Type of target to generate.
         target_future_steps:  How many steps ahead the target looks.
 
     Returns:
-        Dictionary mapping subject_id -> list of batch DataFrames.
+        Dictionary mapping subject_id -> processed DataFrame.
     """
-    batches = {}
-
+    subject_df = {}
     for parquet_file in parquet_files:
         df = pd.read_parquet(parquet_file)
         subject_id = Path(parquet_file).stem.split("_")[0]
 
-        subject_batches = []
-        for start in range(0, len(df), batch_size + gap_size):
-            batch = df.iloc[start : start + batch_size].copy()
+        df = add_future_target(df=df, target_type=target_type, future_steps=target_future_steps)
+        df = df.dropna(subset=['target'])
+        df = add_lag_features(df, features=top_features, max_lag=top_features_lag)
+        df = remove_feature_columns(df, target_type)
 
-            if len(batch) < batch_size:  # drop incomplete trailing batches
-                continue
+        df['subject_id'] = subject_id  # keep track of subject in each batch
+        subject_df[subject_id] = df
 
-            batch = add_future_target(df=batch, target_type=target_type, future_steps=target_future_steps)
-            batch = batch.dropna(subset=['target'])
-            batch = add_lag_features(batch, features=top_features, max_lag=top_features_lag)
-            batch = remove_feature_columns(batch, target_type)
-
-            batch['subject_id'] = subject_id  # keep track of subject in each batch
-            batch['chunk_id'] = f"{subject_id}_chunk{start // (batch_size + gap_size)}"  # unique chunk identifier
-
-            subject_batches.append(batch)
-
-        batches[subject_id] = subject_batches
-
-    return batches
+    return subject_df
 
 
 def add_future_target(df: pd.DataFrame, target_type: str = 'apnea', future_steps: int = 0) -> pd.DataFrame:
@@ -207,39 +206,15 @@ def remove_feature_columns(df: pd.DataFrame, target_type: str) -> pd.DataFrame:
         DataFrame with non-feature columns removed.
     """
     if target_type == 'apnea' or target_type == 'apnea_type':
-        columns_to_drop = sleep_stage_cols + apnea_cols + epoch_cols + subject_col + additional_cols
+        columns_to_drop = sleep_stage_cols + apnea_cols + subject_col + additional_cols
     elif target_type == 'sleep_stage':
         raise NotImplementedError("Feature column removal for sleep stage prediction is not implemented yet.")
+    else:
+        raise ValueError(f"Unsupported target_type: {target_type}")
 
     return df.drop(columns=columns_to_drop)
 
 
-# def add_lag_features(
-#     df: pd.DataFrame,
-#     features: list[str] | None = None,
-#     max_lag: int = 0,
-# ) -> pd.DataFrame:
-#     """
-#     Add lag features for specified columns.
-
-#     Args:
-#         df:       Input DataFrame.
-#         features: List of feature names to create lag features for.
-#         max_lag:  Maximum number of lag periods to create.
-
-#     Returns:
-#         DataFrame with lag features added.
-#     """
-#     if not features or max_lag < 1:
-#         return df
-
-#     df = df.copy()
-#     for feature in features:
-#         for lag in range(1, max_lag + 1):
-#             df[f"{feature}_lag{lag}"] = df[feature].shift(lag)
-
-#     # Drop first max_lag rows which have NaN values from the lag shift
-#     return df.iloc[max_lag:].reset_index(drop=True)
 
 def add_lag_features(
     df: pd.DataFrame,
