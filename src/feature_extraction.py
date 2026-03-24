@@ -88,7 +88,9 @@ def bandpower(data, fs, band):
     low, high = band
     freqs, psd = welch(data, fs=fs, nperseg=min(4*fs,len(data)))
     idx = np.logical_and(freqs>=low, freqs<=high)
-    return np.trapezoid(psd[idx], freqs[idx])
+    
+    return np.trapezoid(psd[idx], freqs[idx]) if int(np.__version__.split('.')[0]) >= 2 else np.trapz(psd[idx], freqs[idx])
+        
 
 def extract_basic_stats(signal):
     return {
@@ -206,22 +208,23 @@ def extract_full_multimodal(df, signals, epoch_sec=EPOCH_SEC, fs=100):
         # Cross-signal features
         # -----------------------------
         # HR/BVP correlation
+        eps = 1e-8
         if 'hr' in epoch_df.columns and 'bvp' in epoch_df.columns and len(epoch_df)>1:
             hr = epoch_df['hr'].values
             bvp = epoch_df['bvp'].values
-            if np.std(hr) > 0 and np.std(bvp) > 0:
+            if np.std(hr) > eps and np.std(bvp) > eps:
                 epoch_feats['hr_bvp_corr'] = np.corrcoef(hr,bvp)[0,1]
             else:
-                epoch_feats['hr_bvp_corr'] = np.nan
+                epoch_feats['hr_bvp_corr'] = 0.0
         
         # ACC + EDA arousal proxy
         if 'eda' in epoch_df.columns and 'acc_magnitude' in epoch_df.columns and len(epoch_df)>1:
             acc_mag = epoch_df['acc_magnitude'].values
             # correlation as simple arousal proxy
-            if np.std(acc_mag)>0 and np.std(epoch_df['eda'].values)>0:
+            if np.std(acc_mag)>eps and np.std(epoch_df['eda'].values)>eps:
                 epoch_feats['acc_eda_corr'] = np.corrcoef(acc_mag, epoch_df['eda'].values)[0,1]
             else:
-                epoch_feats['acc_eda_corr'] = np.nan
+                epoch_feats['acc_eda_corr'] = 0.0
 
         # ------------------------------
         # Target variables
@@ -278,10 +281,14 @@ def process_one_subject(csv_path, out_dir, epoch_sec=EPOCH_SEC, fs=100):
     null_columns = []
     for column, count in df.isnull().sum().items():
         if count > 0:
-            #print(f"Column: {column}, Null Count: {count}")
-            null_columns.append(column)    
+            # print(f"Column: {column}, Null Count: {count}")
+            null_columns.append(column)
+    apnea_events = ['apnea_obstructive', 'apnea_central', 'apnea_hypopnea', 'apnea_mixed']    
     for col in null_columns:
-        df[col] = df[col].apply(lambda x: 0 if pd.isna(x) else 1)
+        if col in apnea_events:
+            df[col] = df[col].apply(lambda x: 0 if pd.isna(x) else 1)
+        else:
+            df[col] = df[col].fillna(0)
     
     signals = list(vars_to_consider.values())
 
