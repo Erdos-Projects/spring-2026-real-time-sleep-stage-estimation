@@ -1,0 +1,18 @@
+{
+    "model_class": "TemporalCNNSleepClassifier",
+    "model_kwargs": {
+        "input_dim": 214,
+        "num_classes": 5,
+        "channels": [
+            32,
+            64,
+            64
+        ],
+        "kernel_size": 5,
+        "dropout": 0.3
+    },
+    "seq_len": 30,
+    "batch_size": 64,
+    "lr": 0.0005,
+    "weight_decay": 0.0001
+}

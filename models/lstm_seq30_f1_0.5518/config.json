@@ -1,0 +1,14 @@
+{
+    "model_class": "LSTMSleepClassifier",
+    "model_kwargs": {
+        "input_dim": 214,
+        "hidden_dim": 32,
+        "num_layers": 1,
+        "num_classes": 5,
+        "dropout": 0.2
+    },
+    "seq_len": 30,
+    "batch_size": 64,
+    "lr": 0.001,
+    "weight_decay": 0.0001
+}

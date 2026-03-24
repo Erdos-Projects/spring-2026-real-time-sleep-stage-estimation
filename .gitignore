@@ -12,7 +12,7 @@ env/
 .venv
 pip-log.txt
 pip-delete-this-directory.txt
-environment.yml
+env*.yml
 
 # Data and large files 
 # Often better to track these with DVC instead of Git
@@ -32,6 +32,10 @@ models/*.h5
 models/*.joblib
 models/*.onnx
 models/*.pth
+models/**/*.pt
+models/**/*.pkl
+models/**/model.json
+models/**/model.txt
 
 # Jupyter Notebooks
 .ipynb_checkpoints
