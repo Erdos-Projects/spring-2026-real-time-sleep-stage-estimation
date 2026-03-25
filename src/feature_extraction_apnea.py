@@ -1,13 +1,13 @@
 """
 Feature extraction for DREAMT 2.1.0 dataset
 - Extracts features from signals for non 'P' sleep stages:
-        basic stats from time-domain signals, bandpowers (extended from -5 epochs to end of current epoch), 
-        HRV metrics, EDA phasic features, cross-signal features 
-- Includes target variables from each epoch: 
-    sleep stage: 
+        basic stats from time-domain signals, bandpowers (extended from -5 epochs to end of current epoch),
+        HRV metrics, EDA phasic features, cross-signal features
+- Includes target variables from each epoch:
+    sleep stage:
         `sleep_stage` (mode), `sleep_stage_transition` (end of epoch, if different from mode),
-        `sleep_stage_trans_prop` (proportion of transitional sleep stage in epoch), 
-    presence of apnea events (0 or 1): 
+        `sleep_stage_trans_prop` (proportion of transitional sleep stage in epoch),
+    presence of apnea events (0 or 1):
         `apnea_obstructive`, `apnea_central`, `apnea_hypopnea`, `apnea_mixed`
 - Output:
     Parquet file per subject with one row per epoch, containing extracted features and target variables
@@ -24,16 +24,19 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
-
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
 from sklearn.preprocessing import MultiLabelBinarizer, OneHotEncoder
-from scipy.signal import welch
+from scipy.signal import welch, find_peaks
 from scipy.stats import entropy
+from scipy.integrate import simpson
 
+from config import dir_config
+compiled_dir = dir_config.data.compiled
+processed_dir = dir_config.data.processed
 
 
 # Variable mapping (raw column name to standardized name)
@@ -44,7 +47,7 @@ vars_to_consider = {
     'o2-m1': 'eeg_o2',
     'fp1-o2': 'eeg_fp1',
     't3-cz': 'eeg_t3',
-    'cz-t4': 'eeg_cz',  
+    'cz-t4': 'eeg_cz',
     'e1': 'eog_e1',
     'e2': 'eog_e2',
     'chin': 'emg_chin',
@@ -77,18 +80,35 @@ EXTENDED_EPOCH_SEC = 25  # for bandpower calculation
 
 # EEG / EOG / EMG bands
 EEG_BANDS = {"delta": (0.5,4), "theta":(4,8), "alpha":(8,12), "sigma":(12,15),
-             "beta":(15,30),"gamma":(30,45),"high_gamma":(45,80)}
+             "beta":(15,30),"gamma":(30,45)} # removing high gamma >45Hz due to low sampling rate and potential noise
 EOG_BANDS = {"slow":(0.1,1),"delta":(1,4),"theta":(4,8),"high":(8,15)}
-EMG_BANDS = {"low":(0.5,10),"medium":(10,30),"high":(30,100)}
+EMG_BANDS = {"low":(0.5,10),"medium":(10,30),"high":(30,45)} # removing >45Hz due to low sampling rate and potential noise
 
 # -----------------------------
 # Helper functions
 # -----------------------------
-def bandpower(data, fs, band):
-    low, high = band
-    freqs, psd = welch(data, fs=fs, nperseg=min(4*fs,len(data)))
-    idx = np.logical_and(freqs>=low, freqs<=high)
-    return np.trapezoid(psd[idx], freqs[idx])
+def bandpower(data, fs, band, log_power=True):
+    """
+    Parameters:
+        data      : 1D array, raw signal in Volts
+        fs        : sampling frequency (Hz)
+        band      : (low, high) frequency band of interest
+        log_power : if True, return log10(µV²); else return raw µV²
+    """
+    data_uv = data * 1e6  # V → µV
+
+    freqs, psd = welch(data_uv, fs=fs, nperseg=min(4*fs, len(data_uv)))
+
+    def integrate_band(low, high):
+        idx = np.logical_and(freqs >= low, freqs <= high)
+        return simpson(psd[idx], x=freqs[idx])
+
+    bp = integrate_band(*band)
+
+    if bp <= 0:
+        return np.nan  # log undefined for non-positive power
+
+    return np.log10(bp) if log_power else bp
 
 def extract_basic_stats(signal):
     return {
@@ -125,6 +145,115 @@ def extract_eda_phasic(eda_signal, threshold=0.01):
     mean_amp = np.mean(diff[peaks]) if count>0 else 0
     return {'eda_scr_count': int(count), 'eda_scr_mean_amp': mean_amp}
 
+def compute_respiratory_rate(resp_flow, fs, min_hz=0.1, max_hz=0.6):
+    """Estimate respiratory rate from flow signal via peak detection.
+
+    Returns breaths-per-minute and inter-breath interval CV (irregularity).
+    """
+    if len(resp_flow) < 2:
+        return {'resp_rate_bpm': np.nan, 'resp_ibi_cv': np.nan}
+
+    min_dist = int(fs / max_hz)  # minimum samples between peaks
+    peaks, _ = find_peaks(resp_flow, distance=min_dist, height=np.percentile(resp_flow, 25))
+
+    n_peaks = len(peaks)
+    duration_sec = len(resp_flow) / fs
+    bpm = (n_peaks / duration_sec) * 60 if duration_sec > 0 else np.nan
+
+    if n_peaks >= 2:
+        ibi = np.diff(peaks) / fs  # inter-breath intervals in seconds
+        cv = np.std(ibi) / np.mean(ibi) if np.mean(ibi) > 0 else np.nan
+    else:
+        cv = np.nan
+
+    return {'resp_rate_bpm': bpm, 'resp_ibi_cv': cv}
+
+
+def compute_thorax_abdomen_coherence(thorax, abdomen):
+    """Pearson correlation between thorax and abdomen effort signals.
+
+    Positive = in-phase (normal breathing).
+    Negative = paradoxical (hallmark of obstructive apnea).
+    """
+    if len(thorax) < 2 or np.std(thorax) == 0 or np.std(abdomen) == 0:
+        return np.nan
+    return float(np.corrcoef(thorax, abdomen)[0, 1])
+
+
+def compute_sao2_desaturation_rate(sao2):
+    """Most negative per-sample change in SpO2 — flags rapid desaturation."""
+    if len(sao2) < 2:
+        return {'sao2_desat_rate': np.nan}
+    return {'sao2_desat_rate': float(np.diff(sao2.astype(float)).min())}
+
+
+def compute_effort_flow_paradox(thorax, abdomen, resp_flow, effort_threshold=0.02, flow_threshold=0.02):
+    """Flag: respiratory effort present (thorax/abdomen moving) but no airflow.
+
+    Returns 1 if paradoxical breathing is detected, else 0.
+    Classic sign of obstructive apnea.
+    """
+    effort_std = (np.std(thorax) + np.std(abdomen)) / 2
+    flow_std = np.std(resp_flow)
+    return int(effort_std > effort_threshold and flow_std < flow_threshold)
+
+
+def compute_hrv_extended(ibi_ms, fs_ibi=100):
+    """HRV metrics on a longer IBI window plus LF/HF frequency ratio.
+
+    ibi_ms: IBI signal values (milliseconds at original sampling rate).
+    """
+    if len(ibi_ms) < 4:
+        return {'ibi_sdnn_ext': np.nan, 'ibi_rmssd_ext': np.nan,
+                'ibi_pnn50_ext': np.nan, 'ibi_lf_hf': np.nan}
+
+    diff = np.diff(ibi_ms)
+    sdnn  = float(np.std(ibi_ms))
+    rmssd = float(np.sqrt(np.mean(diff ** 2)))
+    pnn50 = float(np.sum(np.abs(diff) > 50) / len(diff))
+
+    # LF/HF ratio via Welch PSD on the IBI series
+    try:
+        freqs, psd = welch(ibi_ms, fs=fs_ibi, nperseg=min(4 * fs_ibi, len(ibi_ms)))
+        lf = float(np.trapz(psd[(freqs >= 0.04) & (freqs < 0.15)],
+                             freqs[(freqs >= 0.04) & (freqs < 0.15)]))
+        hf = float(np.trapz(psd[(freqs >= 0.15) & (freqs < 0.40)],
+                             freqs[(freqs >= 0.15) & (freqs < 0.40)]))
+        lf_hf = lf / hf if hf > 0 else np.nan
+    except Exception:
+        lf_hf = np.nan
+
+    return {'ibi_sdnn_ext': sdnn, 'ibi_rmssd_ext': rmssd,
+            'ibi_pnn50_ext': pnn50, 'ibi_lf_hf': lf_hf}
+
+
+def compute_snore_bursts(snore_signal, threshold_pct=75):
+    """Count snore events and measure longest burst duration above threshold.
+
+    Returns snore event count and max burst length (in samples).
+    """
+    if len(snore_signal) < 2:
+        return {'snore_event_count': 0, 'snore_max_burst': 0}
+
+    threshold = np.percentile(np.abs(snore_signal), threshold_pct)
+    above = (np.abs(snore_signal) > threshold).astype(int)
+
+    # Count leading-edge transitions (0→1) as events
+    events = int(np.sum(np.diff(np.concatenate([[0], above])) == 1))
+
+    # Longest consecutive run above threshold
+    max_burst = 0
+    current = 0
+    for v in above:
+        if v:
+            current += 1
+            max_burst = max(max_burst, current)
+        else:
+            current = 0
+
+    return {'snore_event_count': events, 'snore_max_burst': max_burst}
+
+
 # -----------------------------
 # Main extraction function
 # -----------------------------
@@ -133,13 +262,13 @@ def extract_full_multimodal(df, signals, epoch_sec=EPOCH_SEC, fs=100):
     end_time = df['timestamp'].max()
     n_epochs = int((end_time-start_time)//epoch_sec)
     extended_time = EXTENDED_EPOCH_SEC
-    
+
     ## Calculate acceleration magnitude
     if all(x in df.columns for x in ['acc_x','acc_y','acc_z']) and len(df)>0:
         df['acc_magnitude'] = compute_acc_magnitude(df['acc_x'].values,
                                                     df['acc_y'].values,
                                                     df['acc_z'].values)
-    all_features = []        
+    all_features = []
 
     for i in range(n_epochs):
         if (i+1) % (n_epochs//10) == 0:
@@ -149,17 +278,20 @@ def extract_full_multimodal(df, signals, epoch_sec=EPOCH_SEC, fs=100):
         epoch_df = df[(df['timestamp']>=epoch_start)&(df['timestamp']<epoch_end)]
         extended_epoch_df = df[(df['timestamp']>=epoch_start-extended_time)&(df['timestamp']<epoch_end)]
         epoch_feats = {'epoch_id':i, 'epoch_start':epoch_start, 'epoch_end':epoch_end}
-        
+
         # -----------------------------
         # Time-domain features
         # -----------------------------
         for sig in signals:
             if sig in ['acc_x','acc_y','acc_z']:
                 continue
+            if sig in ['eeg_c4', 'eeg_f4', 'eeg_o2', 'eeg_fp1', 'eeg_t3', 'eeg_cz', 'eog_e1', 'eog_e2',
+                       'emg_chin', 'emg_lat', 'emg_rat', 'resp_ptaf', 'resp_flow', 'resp_thorax', 'resp_abdomen', 'snore']:
+                epoch_df.loc[:, sig] = epoch_df.loc[:, sig] * 1e6 # convert to microvolts for EEG/EOG/EMG/resp/snore to get more interpretable stats and avoid numerical issues
             if sig in epoch_df.columns and len(epoch_df[sig])>0:
                 epoch_feats.update({f'{sig}_{k}':v for k,v in extract_basic_stats(epoch_df[sig].values).items()})
-        
-        
+
+
         # -----------------------------
         # EEG bandpowers
         # -----------------------------
@@ -168,7 +300,7 @@ def extract_full_multimodal(df, signals, epoch_sec=EPOCH_SEC, fs=100):
                 eeg_signal = extended_epoch_df[sig].values
                 for band_name, band_range in EEG_BANDS.items():
                     epoch_feats[f'{sig}_bp_{band_name}'] = bandpower(eeg_signal, fs, band_range)
-        
+
         # -----------------------------
         # EOG bandpowers
         # -----------------------------
@@ -177,7 +309,7 @@ def extract_full_multimodal(df, signals, epoch_sec=EPOCH_SEC, fs=100):
                 eog_signal = extended_epoch_df[sig].values
                 for band_name, band_range in EOG_BANDS.items():
                     epoch_feats[f'{sig}_bp_{band_name}'] = bandpower(eog_signal, fs, band_range)
-        
+
         # -----------------------------
         # EMG bandpowers
         # -----------------------------
@@ -186,49 +318,105 @@ def extract_full_multimodal(df, signals, epoch_sec=EPOCH_SEC, fs=100):
                 emg_signal = extended_epoch_df[sig].values
                 for band_name, band_range in EMG_BANDS.items():
                     epoch_feats[f'{sig}_bp_{band_name}'] = bandpower(emg_signal, fs, band_range)
-        
+
         # -----------------------------
-        # IBI / HRV metrics
+        # IBI / HRV metrics (short window — kept for backward compatibility)
         # -----------------------------
         if 'ibi' in epoch_df.columns and len(epoch_df['ibi'])>1:
             ibi_ms = epoch_df['ibi'].values
             hrv = compute_hrv_metrics(ibi_ms)
             epoch_feats.update({f'ibi_{k}':v for k,v in hrv.items()})
-        
+
+        # HRV on extended 25s window + LF/HF ratio
+        if 'ibi' in extended_epoch_df.columns and len(extended_epoch_df['ibi']) > 3:
+            hrv_ext = compute_hrv_extended(extended_epoch_df['ibi'].values, fs_ibi=fs)
+            epoch_feats.update(hrv_ext)
+
         # -----------------------------
         # EDA phasic peaks
         # -----------------------------
         if 'eda' in epoch_df.columns and len(epoch_df['eda'])>1:
             eda_feats = extract_eda_phasic(epoch_df['eda'].values)
             epoch_feats.update(eda_feats)
-        
+
         # -----------------------------
         # Cross-signal features
         # -----------------------------
+        corr_threshold = 1e-3
         # HR/BVP correlation
         if 'hr' in epoch_df.columns and 'bvp' in epoch_df.columns and len(epoch_df)>1:
             hr = epoch_df['hr'].values
             bvp = epoch_df['bvp'].values
-            if np.std(hr) > 0 and np.std(bvp) > 0:
+            # check for constant signals to avoid NaN correlation
+
+            if np.std(hr) > corr_threshold and np.std(bvp) > corr_threshold:
                 epoch_feats['hr_bvp_corr'] = np.corrcoef(hr,bvp)[0,1]
             else:
-                epoch_feats['hr_bvp_corr'] = np.nan
-        
+                epoch_feats['hr_bvp_corr'] = 0
+
         # ACC + EDA arousal proxy
         if 'eda' in epoch_df.columns and 'acc_magnitude' in epoch_df.columns and len(epoch_df)>1:
             acc_mag = epoch_df['acc_magnitude'].values
             # correlation as simple arousal proxy
-            if np.std(acc_mag)>0 and np.std(epoch_df['eda'].values)>0:
+            if np.std(acc_mag)>corr_threshold and np.std(epoch_df['eda'].values)>corr_threshold:
                 epoch_feats['acc_eda_corr'] = np.corrcoef(acc_mag, epoch_df['eda'].values)[0,1]
             else:
-                epoch_feats['acc_eda_corr'] = np.nan
+                epoch_feats['acc_eda_corr'] = 0
+
+        # -----------------------------
+        # Respiratory clinical features
+        # -----------------------------
+        # Respiratory rate (breaths per minute) and irregularity — use extended window for stability
+        if 'resp_flow' in extended_epoch_df.columns and len(extended_epoch_df['resp_flow']) > fs:
+            rr = compute_respiratory_rate(extended_epoch_df['resp_flow'].values, fs=fs)
+            epoch_feats.update(rr)
+
+        # Thorax-abdomen phase coherence (negative = paradoxical breathing = obstructive sign)
+        if ('resp_thorax' in extended_epoch_df.columns and
+                'resp_abdomen' in extended_epoch_df.columns and
+                len(extended_epoch_df) > 1):
+            epoch_feats['resp_thorax_abdomen_coherence'] = compute_thorax_abdomen_coherence(
+                extended_epoch_df['resp_thorax'].values,
+                extended_epoch_df['resp_abdomen'].values,
+            )
+
+        # Effort-flow paradox flag (effort present but no airflow)
+        if all(c in epoch_df.columns for c in ['resp_thorax', 'resp_abdomen', 'resp_flow']):
+            epoch_feats['resp_effort_flow_paradox'] = compute_effort_flow_paradox(
+                epoch_df['resp_thorax'].values,
+                epoch_df['resp_abdomen'].values,
+                epoch_df['resp_flow'].values,
+            )
+
+        # SpO2 desaturation rate (most negative per-sample drop)
+        if 'sao2' in epoch_df.columns and len(epoch_df['sao2']) > 1:
+            epoch_feats.update(compute_sao2_desaturation_rate(epoch_df['sao2'].values))
+
+        # -----------------------------
+        # Snore burst features
+        # -----------------------------
+        if 'snore' in epoch_df.columns and len(epoch_df['snore']) > 1:
+            epoch_feats.update(compute_snore_bursts(epoch_df['snore'].values))
+
+        # -----------------------------
+        # EEG arousal ratio: (beta+gamma) / (delta+theta) — arousals from apnea increase this
+        # -----------------------------
+        for sig in signals:
+            if sig.lower().startswith('eeg') and sig in epoch_df.columns:
+                eeg_ext = extended_epoch_df[sig].values
+                bp_delta = bandpower(eeg_ext, fs, EEG_BANDS['delta'])
+                bp_theta = bandpower(eeg_ext, fs, EEG_BANDS['theta'])
+                bp_beta  = bandpower(eeg_ext, fs, EEG_BANDS['beta'])
+                bp_gamma = bandpower(eeg_ext, fs, EEG_BANDS['gamma'])
+                denom = bp_delta + bp_theta
+                epoch_feats[f'{sig}_arousal_ratio'] = (bp_beta + bp_gamma) / denom if denom > 0 else np.nan
 
         # ------------------------------
         # Target variables
-        # ------------------------------ 
+        # ------------------------------
         # Sleep stage (mode in epoch)
         if 'sleep_stage' in epoch_df.columns and len(epoch_df['sleep_stage'])>0:
-            s0 = epoch_df['sleep_stage'].iloc[0]     # proxy for mode, based on observation 
+            s0 = epoch_df['sleep_stage'].iloc[0]     # proxy for mode, based on observation
             s1 = epoch_df['sleep_stage'].iloc[-1]    # end stage
             epoch_feats['sleep_stage'] = s0
             # Sleep stage transition (last vs mode), proportion of epoch in transition
@@ -243,10 +431,10 @@ def extract_full_multimodal(df, signals, epoch_sec=EPOCH_SEC, fs=100):
         for apnea_type in ['apnea_obstructive', 'apnea_central', 'apnea_hypopnea', 'apnea_mixed']:
             if apnea_type in epoch_df.columns:
                 # 1 if any event in epoch, else 0
-                epoch_feats[apnea_type] = epoch_df[apnea_type].max()  
-        
+                epoch_feats[apnea_type] = epoch_df[apnea_type].max()
+
         all_features.append(epoch_feats)
-    
+
     return pd.DataFrame(all_features)
 
 
@@ -260,7 +448,7 @@ def process_one_subject(csv_path, out_dir, epoch_sec=EPOCH_SEC, fs=100):
     # skip if already computed
     if out_path.exists():
         return sid, "skipped"
-    
+
     print(f"Processing {sid}...")
 
     df_original = pd.read_csv(csv_path)
@@ -279,17 +467,17 @@ def process_one_subject(csv_path, out_dir, epoch_sec=EPOCH_SEC, fs=100):
     for column, count in df.isnull().sum().items():
         if count > 0:
             #print(f"Column: {column}, Null Count: {count}")
-            null_columns.append(column)    
+            null_columns.append(column)
     for col in null_columns:
         df[col] = df[col].apply(lambda x: 0 if pd.isna(x) else 1)
-    
+
     signals = list(vars_to_consider.values())
 
     # Remove timestamp and label/indicator columns (not continuous signals)
-    exclude_from_features = {'timestamp', 'sleep_stage', 'apnea_obstructive', 
+    exclude_from_features = {'timestamp', 'sleep_stage', 'apnea_obstructive',
                              'apnea_central', 'apnea_hypopnea', 'apnea_mixed'}
     signals = [s for s in signals if s not in exclude_from_features]
-    df['sleep_stage'] = df['sleep_stage'].astype('category')  
+    df['sleep_stage'] = df['sleep_stage'].astype('category')
     feats = extract_full_multimodal(df, signals=signals, epoch_sec=epoch_sec, fs=fs)
 
     feats.to_parquet(out_path, index=False)  # snappy by default in many installs
@@ -315,11 +503,12 @@ def run_all(input_dir, out_dir, epoch_sec, fs, max_workers=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input_dir", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--epoch_sec", type=int, default=EPOCH_SEC)
     parser.add_argument("--fs", type=int, default=100)
     parser.add_argument("--max_workers", type=int, default=None)
+    parser.add_argument("--input_dir", type=str, default=str(Path(compiled_dir, "data_100Hz")))
+    parser.add_argument("--output_dir", type=str, default=str(Path(processed_dir)))
+
     args = parser.parse_args()
 
     # Start with max_workers=4 or 6 and scale up
