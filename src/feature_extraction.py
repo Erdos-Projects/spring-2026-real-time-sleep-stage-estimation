@@ -290,6 +290,12 @@ def process_one_subject(csv_path, out_dir, epoch_sec=EPOCH_SEC, fs=100):
         else:
             df[col] = df[col].fillna(0)
     
+    # correct magnitude from V to uV
+    electro_signals = ['eeg_c4', 'eeg_f4', 'eeg_o2', 'eeg_fp1', 'eeg_t3', 'eeg_cz', 'eog_e1', 'eog_e2', 'emg_chin', 'emg_lat', 'emg_rat', 'resp_ptaf', 'resp_flow', 'resp_thorax', 'resp_abdomen', 'snore']
+    for col in electro_signals:
+        if col in df.columns:
+            df[col] = df[col] * 1e6
+
     signals = list(vars_to_consider.values())
 
     # Remove timestamp and label/indicator columns (not continuous signals)

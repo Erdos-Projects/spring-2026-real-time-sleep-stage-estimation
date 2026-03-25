@@ -24,6 +24,8 @@ from __future__ import annotations
 import copy
 import json
 import os
+from collections import Counter
+from pathlib import Path
 
 import joblib
 import matplotlib.pyplot as plt
@@ -38,6 +40,155 @@ from sklearn.metrics import (
 )
 from sklearn.utils.class_weight import compute_class_weight
 from torch.utils.data import DataLoader
+
+
+# ---------------------------------------------------------------------------
+# Feature engineering pipeline
+# ---------------------------------------------------------------------------
+
+class SleepFeaturePipeline:
+    """Serializable feature-engineering pipeline for sleep-stage models.
+
+    Steps
+    -----
+    1. ``add_core_sleep_ratios``  – relative band-power + cross-band ratios per EEG channel.
+    2. ``add_lag_features``       – temporal lag columns for selected signals.
+
+    Usage
+    -----
+    >>> pipe = SleepFeaturePipeline(
+    ...     ratio_cols=["eeg_c4", "eeg_f4"],
+    ...     lag_features=["eeg_c4_bp_delta", "hr_mean"],
+    ...     lags=(1, 2, 3),
+    ...     original_cols=FEAT_COLS + FEAT_METADATA_COLS,
+    ... )
+    >>> X_tr, y_tr, info_tr = pipe.fit_transform(X_train, y_train, info_train)
+    >>> X_va, y_va, info_va = pipe.transform(X_val,  y_val,  info_val)
+    >>> pipe.save("models/feat_pipeline.joblib")
+    >>> pipe2 = SleepFeaturePipeline.load("models/feat_pipeline.joblib")
+    """
+
+    def __init__(
+        self,
+        ratio_cols: list[str],
+        lag_features: list[str],
+        lags: tuple[int, ...] = (1, 2, 3),
+        original_cols: list[str] | None = None,
+        eps: float = 1e-6,
+    ) -> None:
+        self.ratio_cols = ratio_cols
+        self.lag_features = lag_features
+        self.lags = lags
+        self.original_cols = original_cols
+        self.eps = eps
+        # set after fit_transform
+        self.feature_names_: list[str] | None = None
+        self._names_after_ratio: list[str] | None = None
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _add_ratios(self, X: np.ndarray) -> tuple[np.ndarray, list[str]]:
+        assert self.original_cols is not None, "original_cols must be set before transform"
+        df = pd.DataFrame(X, columns=self.original_cols)
+        eps = self.eps
+        for ch in self.ratio_cols:
+            delta = df[f"{ch}_bp_delta"]
+            theta = df[f"{ch}_bp_theta"]
+            alpha = df[f"{ch}_bp_alpha"]
+            sigma = df[f"{ch}_bp_sigma"]
+            beta  = df[f"{ch}_bp_beta"]
+            total = delta + theta + alpha + sigma + beta
+            df[f"{ch}_bp_delta_rel"]        = delta / (total + eps)
+            df[f"{ch}_bp_theta_rel"]        = theta / (total + eps)
+            df[f"{ch}_bp_alpha_rel"]        = alpha / (total + eps)
+            df[f"{ch}_bp_sigma_rel"]        = sigma / (total + eps)
+            df[f"{ch}_bp_beta_rel"]         = beta  / (total + eps)
+            df[f"{ch}_bp_delta_over_theta"] = delta / (theta + eps)
+            df[f"{ch}_bp_delta_over_alpha"] = delta / (alpha + eps)
+            df[f"{ch}_bp_theta_over_alpha"] = theta / (alpha + eps)
+            df[f"{ch}_bp_sigma_over_delta"] = sigma / (delta + eps)
+        return df.to_numpy(dtype=np.float32), df.columns.tolist()
+
+    def _add_lags(
+        self,
+        X: np.ndarray,
+        feature_names: list[str],
+    ) -> tuple[np.ndarray, list[str], np.ndarray]:
+        df = pd.DataFrame(X, columns=feature_names)
+        for col in self.lag_features:
+            if col not in df.columns:
+                raise ValueError(f"Lag feature '{col}' not found in feature names")
+            for lag in self.lags:
+                df[f"{col}_lag{lag}"] = df[col].shift(lag)
+        keep_idx = np.arange(max(self.lags), len(df))
+        df = df.iloc[keep_idx].reset_index(drop=True)
+        return df.to_numpy(dtype=np.float32), df.columns.tolist(), keep_idx
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def fit_transform(
+        self,
+        X: np.ndarray,
+        y: np.ndarray | None = None,
+        info: "pd.DataFrame | None" = None,
+    ) -> tuple:
+        """Apply both steps and store resulting feature names for future transforms."""
+        X_ratio, names_ratio = self._add_ratios(X)
+        X_out, names_out, keep_idx = self._add_lags(X_ratio, names_ratio)
+        self.feature_names_ = names_out
+        self._names_after_ratio = names_ratio
+        out: list = [X_out]
+        if y is not None:
+            out.append(y[keep_idx])
+        if info is not None:
+            out.append(info.iloc[keep_idx].reset_index(drop=True))
+        return tuple(out) if len(out) > 1 else X_out
+
+    def transform(
+        self,
+        X: np.ndarray,
+        y: np.ndarray | None = None,
+        info: "pd.DataFrame | None" = None,
+    ) -> tuple:
+        """Apply the pipeline using the configuration stored by ``fit_transform``."""
+        if self._names_after_ratio is None:
+            raise RuntimeError("Call fit_transform before transform.")
+        X_ratio, _ = self._add_ratios(X)
+        X_out, _, keep_idx = self._add_lags(X_ratio, self._names_after_ratio)
+        out: list = [X_out]
+        if y is not None:
+            out.append(y[keep_idx])
+        if info is not None:
+            out.append(info.iloc[keep_idx].reset_index(drop=True))
+        return tuple(out) if len(out) > 1 else X_out
+
+    def save(self, path: str | os.PathLike) -> None:
+        """Persist the fitted pipeline to disk with joblib."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(self, path)
+        print(f"Feature pipeline saved → {path}")
+
+    @classmethod
+    def load(cls, path: str | os.PathLike) -> "SleepFeaturePipeline":
+        """Load a previously saved pipeline."""
+        pipe = joblib.load(path)
+        if not isinstance(pipe, cls):
+            raise TypeError(f"Loaded object is {type(pipe)}, expected {cls.__name__}")
+        print(f"Feature pipeline loaded ← {path}")
+        return pipe
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return (
+            f"SleepFeaturePipeline("
+            f"ratio_cols={self.ratio_cols}, "
+            f"lag_features={self.lag_features}, "
+            f"lags={self.lags})"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +530,44 @@ def evaluate_saved_sequence_model(
         "confusion_matrix": cm,
         "classification_report_df": report_df,
     }
+
+
+# ---------------------------------------------------------------------------
+# Post-processing helpers
+# ---------------------------------------------------------------------------
+
+def mode_filter_1d(y: np.ndarray, kernel_size: int = 5) -> np.ndarray:
+    """Apply a mode (majority-vote) smoothing filter along a 1-D label sequence.
+
+    Parameters
+    ----------
+    y : array-like of int
+        Predicted label sequence.
+    kernel_size : int, optional
+        Window width (must be odd).  Default is 5.
+
+    Returns
+    -------
+    np.ndarray
+        Smoothed label sequence of the same length as *y*.
+        Tie-breaking rule: keep the centre label when it appears in the
+        majority set, otherwise take the first majority candidate.
+    """
+    assert kernel_size % 2 == 1, "kernel_size must be odd"
+    pad = kernel_size // 2
+    y = np.asarray(y)
+    y_pad = np.pad(y, (pad, pad), mode="edge")
+    out = np.empty_like(y)
+
+    for i in range(len(y)):
+        window = y_pad[i : i + kernel_size]
+        cnt = Counter(window)
+        max_count = max(cnt.values())
+        candidates = [k for k, v in cnt.items() if v == max_count]
+        center = y[i]
+        out[i] = center if center in candidates else candidates[0]
+
+    return out
 
 
 def plot_confusion_matrix(
