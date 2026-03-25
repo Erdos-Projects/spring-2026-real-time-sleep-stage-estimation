@@ -24,7 +24,6 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
-
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -33,6 +32,7 @@ from pathlib import Path
 from sklearn.preprocessing import MultiLabelBinarizer, OneHotEncoder
 from scipy.signal import welch, find_peaks
 from scipy.stats import entropy
+from scipy.integrate import simpson
 
 from config import dir_config
 compiled_dir = dir_config.data.compiled
@@ -80,18 +80,35 @@ EXTENDED_EPOCH_SEC = 25  # for bandpower calculation
 
 # EEG / EOG / EMG bands
 EEG_BANDS = {"delta": (0.5,4), "theta":(4,8), "alpha":(8,12), "sigma":(12,15),
-             "beta":(15,30),"gamma":(30,45),"high_gamma":(45,80)}
+             "beta":(15,30),"gamma":(30,45)} # removing high gamma >45Hz due to low sampling rate and potential noise
 EOG_BANDS = {"slow":(0.1,1),"delta":(1,4),"theta":(4,8),"high":(8,15)}
-EMG_BANDS = {"low":(0.5,10),"medium":(10,30),"high":(30,100)}
+EMG_BANDS = {"low":(0.5,10),"medium":(10,30),"high":(30,45)} # removing >45Hz due to low sampling rate and potential noise
 
 # -----------------------------
 # Helper functions
 # -----------------------------
-def bandpower(data, fs, band):
-    low, high = band
-    freqs, psd = welch(data, fs=fs, nperseg=min(4*fs,len(data)))
-    idx = np.logical_and(freqs>=low, freqs<=high)
-    return np.trapz(psd[idx], freqs[idx])
+def bandpower(data, fs, band, log_power=True):
+    """
+    Parameters:
+        data      : 1D array, raw signal in Volts
+        fs        : sampling frequency (Hz)
+        band      : (low, high) frequency band of interest
+        log_power : if True, return log10(µV²); else return raw µV²
+    """
+    data_uv = data * 1e6  # V → µV
+
+    freqs, psd = welch(data_uv, fs=fs, nperseg=min(4*fs, len(data_uv)))
+
+    def integrate_band(low, high):
+        idx = np.logical_and(freqs >= low, freqs <= high)
+        return simpson(psd[idx], x=freqs[idx])
+
+    bp = integrate_band(*band)
+
+    if bp <= 0:
+        return np.nan  # log undefined for non-positive power
+
+    return np.log10(bp) if log_power else bp
 
 def extract_basic_stats(signal):
     return {
@@ -268,6 +285,9 @@ def extract_full_multimodal(df, signals, epoch_sec=EPOCH_SEC, fs=100):
         for sig in signals:
             if sig in ['acc_x','acc_y','acc_z']:
                 continue
+            if sig in ['eeg_c4', 'eeg_f4', 'eeg_o2', 'eeg_fp1', 'eeg_t3', 'eeg_cz', 'eog_e1', 'eog_e2',
+                       'emg_chin', 'emg_lat', 'emg_rat', 'resp_ptaf', 'resp_flow', 'resp_thorax', 'resp_abdomen', 'snore']:
+                epoch_df.loc[:, sig] = epoch_df.loc[:, sig] * 1e6 # convert to microvolts for EEG/EOG/EMG/resp/snore to get more interpretable stats and avoid numerical issues
             if sig in epoch_df.columns and len(epoch_df[sig])>0:
                 epoch_feats.update({f'{sig}_{k}':v for k,v in extract_basic_stats(epoch_df[sig].values).items()})
 

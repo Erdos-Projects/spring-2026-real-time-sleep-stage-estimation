@@ -36,3 +36,4 @@ xgboost
 lightgbm
 shap
 optuna
+imbalanced-learn

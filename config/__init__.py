@@ -20,3 +20,5 @@ def load_config(filename):
 dir_config = load_config("dir-config.yaml")
 apnea_model_config = load_config("apnea-model.yaml")
 sleep_model_config = load_config("sleep-model.yaml")
+
+random_seed = 2542 #255

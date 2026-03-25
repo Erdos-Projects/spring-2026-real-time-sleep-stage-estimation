@@ -2,7 +2,7 @@
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from sklearn.model_selection import KFold, train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold, KFold
 
 sleep_stage_cols = ['sleep_stage', 'sleep_stage_transition', 'sleep_stage_trans_prop']
 apnea_cols = ['apnea_obstructive', 'apnea_central', 'apnea_hypopnea', 'apnea_mixed']
@@ -12,33 +12,16 @@ additional_cols = ['ahi', 'oahi', 'arousal_index']
 
 def create_train_val_test_splits(
     parquet_files: list,
+    metadata: pd.DataFrame,
     top_features: list[str] | None = None,
     top_features_lag: int = 5,
     target_type: str = 'apnea',
     target_future_steps: int = 5,
     val_ratio: float = 0.15,
     test_ratio: float = 0.2,
-    n_splits: int = 10,
+    n_splits: int = 5,
     random_seed: int = 2542,
 ):
-    """
-    Batch parquet files into non-overlapping windows and split into train/val/test sets.
-
-    Args:
-        parquet_files:        List of parquet file paths.
-        top_features:         Features to create lag features for. None means no lag features.
-        top_features_lag:     Number of lag steps to generate for top_features.
-        target_type:          Type of target to generate ('apnea' supported).
-        target_future_steps:  How many steps ahead the target looks.
-        val_ratio:            Fraction of each subject's batches for validation.
-        test_ratio:           Fraction of each subject's batches for testing.
-        n_splits:             Number of K-fold splits over train subjects.
-        random_seed:          Random seed for reproducibility.
-
-    Returns:
-        train_X, train_y, fold_indices, val_X, val_y, test_X, test_y
-        where fold_indices contains (train_idx, val_idx) for each fold.
-    """
     subject_df = _process_subjects(
         parquet_files=parquet_files,
         top_features=top_features or [],
@@ -47,45 +30,59 @@ def create_train_val_test_splits(
         target_future_steps=target_future_steps,
     )
 
-    # Drop subjects that produced zero valid batches (recording too short for batch_size)
-    # batches = {sid: b for sid, b in batches.items() if len(b) > 0}
-
     subject_ids = np.array(list(subject_df.keys()))
     if len(subject_ids) == 0:
-        raise ValueError(
-            "No valid batches were produced. Check that parquet_files is non-empty "
-        )
-
-    # train/test 80/20 split subjects
-    train_subjects, test_subjects = train_test_split(subject_ids, test_size=test_ratio, random_state=random_seed)
-    train_subjects, val_subjects = train_test_split(train_subjects, test_size=val_ratio, random_state=random_seed)
-
-    train_df = pd.concat([subject_df[sid] for sid in train_subjects], ignore_index=True)
-    val_df = pd.concat([subject_df[sid] for sid in val_subjects], ignore_index=True)
-    test_df = pd.concat([subject_df[sid] for sid in test_subjects], ignore_index=True)
-
+        raise ValueError("No valid batches were produced. Check that parquet_files is non-empty.")
 
     if n_splits < 2:
         raise ValueError("n_splits must be at least 2.")
+
+    # --- Look up per-subject apnea severity stratum for stratified splitting ---
+    severity_lookup = metadata.set_index('subject_id')['ahi_stratum']
+    subject_strata = np.array([severity_lookup[sid] for sid in subject_ids])
+
+    # # --- Stratified subject-level splits ---
+    # train_subjects, test_subjects = train_test_split(
+    #     subject_ids, test_size=test_ratio, random_state=random_seed, stratify=subject_strata
+    # )
+    # train_strata = subject_strata[np.isin(subject_ids, train_subjects)]
+    # train_subjects, val_subjects = train_test_split(
+    #     train_subjects, test_size=val_ratio, random_state=random_seed, stratify=train_strata
+    # )
+
+    strata_lookup = dict(zip(subject_ids, subject_strata))
+    train_subjects, test_subjects = train_test_split(
+        subject_ids, test_size=test_ratio, random_state=random_seed, stratify=subject_strata
+    )
+    train_strata = np.array([strata_lookup[sid] for sid in train_subjects])
+    train_subjects, val_subjects = train_test_split(
+        train_subjects, test_size=val_ratio, random_state=random_seed, stratify=train_strata
+    )
+
     if n_splits > len(train_subjects):
         raise ValueError(
             f"n_splits={n_splits} cannot be greater than number of train subjects="
             f"{len(train_subjects)}. Reduce n_splits or test_ratio."
         )
 
+    train_df = pd.concat([subject_df[sid] for sid in train_subjects], ignore_index=True)
+    val_df = pd.concat([subject_df[sid] for sid in val_subjects], ignore_index=True)
+    test_df = pd.concat([subject_df[sid] for sid in test_subjects], ignore_index=True)
+
     train_df, val_df, test_df = _remove_missing_values(train_df, val_df, test_df, missing_threshold=0.2)
     train_df = train_df.reset_index(drop=True)
     val_df = val_df.reset_index(drop=True)
     test_df = test_df.reset_index(drop=True)
 
-    # Build subject-level CV splits and map each split to row indices in train_df.
-    kfold = KFold(n_splits=n_splits, shuffle=True, random_state=random_seed)
+    # --- Stratified KFold CV on train subjects ---
+    train_subject_strata = subject_strata[np.isin(subject_ids, train_subjects)]
+    kfold = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_seed)
     row_indices_by_subject = {
         sid: train_df.index[train_df['subject_id'] == sid].to_numpy()
         for sid in train_subjects
     }
     fold_indices = []
-    for train_sid_idx, val_sid_idx in kfold.split(train_subjects):
+    for train_sid_idx, val_sid_idx in kfold.split(train_subjects, train_subject_strata):
         train_sid_fold = train_subjects[train_sid_idx]
         val_sid_fold = train_subjects[val_sid_idx]
         train_idx = np.concatenate([row_indices_by_subject[sid] for sid in train_sid_fold])
@@ -102,27 +99,35 @@ def create_train_val_test_splits(
     return train_X, train_y, fold_indices, val_X, val_y, test_X, test_y
 
 def _remove_missing_values(train_df, val_df, test_df, missing_threshold=0.2):
+    # Drop columns that are 100% NaN for any single subject in any split
+    all_df = pd.concat([train_df, val_df, test_df])
+    per_subject_all_nan = (
+        all_df.groupby('subject_id')
+        .apply(lambda x: x.isna().all())
+        .any(axis=0)
+    )
+    subject_nan_cols = per_subject_all_nan[per_subject_all_nan].index.tolist()
+
+    # Drop columns with >20% missing across the split
     missing_train = train_df.isnull().mean()
-    missing_val = val_df.isnull().mean()
-    missing_test = test_df.isnull().mean()
-
-    # make a list of columns which have more than 20% missing values in any of the three sets
-    columns_to_drop = missing_train[missing_train > missing_threshold].index.tolist() + \
-        missing_val[missing_val > missing_threshold].index.tolist() + \
+    missing_val   = val_df.isnull().mean()
+    missing_test  = test_df.isnull().mean()
+    threshold_cols = (
+        missing_train[missing_train > missing_threshold].index.tolist() +
+        missing_val[missing_val   > missing_threshold].index.tolist() +
         missing_test[missing_test > missing_threshold].index.tolist()
-    columns_to_drop = list(set(columns_to_drop))
-    train_df = train_df.drop(columns=columns_to_drop)
-    val_df = val_df.drop(columns=columns_to_drop)
-    test_df = test_df.drop(columns=columns_to_drop)
+    )
 
-    # find rows with NaN values in train_X, train_y, val_X, val_y, test_X, test_y
-    train_nan_rows = train_df.isna().any(axis=1)
-    val_nan_rows = val_df.isna().any(axis=1)
-    test_nan_rows = test_df.isna().any(axis=1)
-    # remove rows with NaN values
-    train_df = train_df[~train_nan_rows].reset_index(drop=True)
-    val_df = val_df[~val_nan_rows].reset_index(drop=True)
-    test_df = test_df[~test_nan_rows].reset_index(drop=True)
+    columns_to_drop = list(set(subject_nan_cols + threshold_cols))
+    train_df = train_df.drop(columns=columns_to_drop)
+    val_df   = val_df.drop(columns=columns_to_drop)
+    test_df  = test_df.drop(columns=columns_to_drop)
+
+    # Drop remaining rows with any NaN
+    train_df = train_df[~train_df.isna().any(axis=1)].reset_index(drop=True)
+    val_df   = val_df[~val_df.isna().any(axis=1)].reset_index(drop=True)
+    test_df  = test_df[~test_df.isna().any(axis=1)].reset_index(drop=True)
+
     return train_df, val_df, test_df
 
 def _process_subjects(
@@ -157,6 +162,10 @@ def _process_subjects(
         df = remove_feature_columns(df, target_type)
 
         df['subject_id'] = subject_id  # keep track of subject in each batch
+
+        if len(df) == 0:
+            print(f"⚠ Subject {subject_id} produced 0 rows after processing — skipped.")
+            continue
         subject_df[subject_id] = df
 
     return subject_df
