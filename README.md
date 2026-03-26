@@ -1,4 +1,4 @@
-# Real-Time Sleep Stage Estimation — Spring 2026
+# Towards Automated Sleep Analysis: Stage Classification and Apnea Prediction - Spring 2026
 
 A team research project developing machine learning models for **real-time sleep stage classification** and **sleep apnea detection** from polysomnography (PSG) wearable signals.
 
