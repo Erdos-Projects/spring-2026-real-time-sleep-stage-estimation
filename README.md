@@ -141,6 +141,19 @@ Both pipelines include feature engineering, hyperparameter optimization via Optu
 
 ## Results
 
+### Sleep Stage Classification — Validation Set Comparison
+
+| Model | Macro F1 | Weighted F1 | N1 F1 |
+|---|---|---|---|
+| **XGBoost** | **0.6677** | **0.7949** | 0.3594 |
+| LightGBM | 0.6538 | 0.7905 | 0.3675 |
+| LSTM | 0.5924 | 0.6966 | 0.3324 |
+| BiLSTM | 0.5673 | 0.6763 | 0.2911 |
+| CNN1D | 0.5553 | 0.6620 | 0.3065 |
+| Logistic Regression (baseline) | 0.4301 | 0.5449 | 0.2226 |
+
+> XGBoost achieves the best macro and weighted F1 on the validation set. N1 is the hardest stage across all models due to its transitional nature.
+
 ### Sleep Stage Classification (Test Set — 86,972 samples)
 
 | Model | Macro F1 | Accuracy |
@@ -149,9 +162,6 @@ Both pipelines include feature engineering, hyperparameter optimization via Optu
 | LightGBM | 0.6579 | 0.7360 |
 | Ensemble (XGB + LGB) | 0.6593 | 0.7353 |
 | **Ensemble + mode filter (k=5)** | **0.6658** | **0.7408** |
-| BiLSTM (seq=10) | 0.5673 | — |
-| LSTM (seq=30) | 0.5924 | — |
-| CNN1D (seq=30) | 0.5553 | — |
 
 **Per-stage breakdown (best model — Ensemble + mode filter):**
 
@@ -167,13 +177,29 @@ Both pipelines include feature engineering, hyperparameter optimization via Optu
 
 ### Sleep Apnea Detection (Validation Set)
 
-| Metric | Value |
-|---|---|
-| AUC-ROC | ~0.83 |
-| AUC-PR | ~0.42 |
-| F1 (threshold-optimized) | ~0.43 |
+Performance by max feature lag window:
 
-> Best results achieved with 75-second lag window (15 lagged epochs of history).
+| Max Feature Lag (secs) | Macro F1 | AUC-ROC | AUC-PR |
+|---|---|---|---|
+| 0 | 0.439 | 0.810 | 0.396 |
+| 25 | 0.430 | 0.799 | 0.385 |
+| 50 | 0.451 | 0.820 | 0.416 |
+| **75** | **0.460** | **0.825** | **0.430** |
+
+> Best results achieved with 75-second lag window (15 lagged epochs of history). Performance dips at 25-second lag before recovering, suggesting short-range lag features add noise while longer history is informative.
+
+### Sleep Apnea Detection (Test Set)
+
+**AUC-ROC = 0.786 | AUC-PR = 0.467 | Accuracy = 0.88**
+
+| Class | Precision | Recall | F1 |
+|---|---|---|---|
+| No apnea | 0.93 | 0.94 | 0.93 |
+| Apnea | 0.54 | 0.50 | 0.52 |
+| Macro avg | 0.73 | 0.72 | 0.72 |
+| Weighted avg | 0.88 | 0.88 | 0.88 |
+
+> Class imbalance is evident — the model achieves strong overall accuracy driven by the majority (no apnea) class. Apnea recall of 0.50 indicates room for improvement in catching true positive events.
 
 ---
 
