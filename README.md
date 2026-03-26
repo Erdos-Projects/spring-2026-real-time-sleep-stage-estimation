@@ -38,7 +38,7 @@ Both pipelines include feature engineering, hyperparameter optimization via Optu
 
 | Property | Value |
 |---|---|
-| Subjects | ~102 (S2–S103) |
+| Subjects | 100 |
 | Sampling rate | 100 Hz |
 | Epoch length | 5 seconds |
 | Labels | Wake (W), N1, N2, N3, REM (R) + AHI apnea events |
